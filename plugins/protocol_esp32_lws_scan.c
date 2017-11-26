@@ -56,6 +56,8 @@ struct per_session_data__esplws_scan {
 	unsigned char changed_partway:1;
 };
 
+#define max_aps 12
+
 struct per_vhost_data__esplws_scan {
 	wifi_ap_record_t ap_records[10];
 	TimerHandle_t timer, reboot_timer;
@@ -63,6 +65,7 @@ struct per_vhost_data__esplws_scan {
 	struct lws_context *context;
 	struct lws_vhost *vhost;
 	const struct lws_protocols *protocol;
+	struct lws_wifi_scan *known_aps_list;
 
 	const esp_partition_t *part;
 	esp_ota_handle_t otahandle;
@@ -74,6 +77,9 @@ struct per_vhost_data__esplws_scan {
 	struct lws *cwsi;
 	char json[2048];
 	int json_len;
+
+	int acme_state;
+	char acme_msg[256];
 
 	uint16_t count_ap_records;
 	char count_live_pss;
@@ -159,6 +165,9 @@ scan_start(struct per_vhost_data__esplws_scan *vhd)
 	if (vhd->scan_ongoing)
 		return;
 
+	if (lws_esp32.acme)
+		return;
+
 	vhd->scan_ongoing = 1;
 	lws_esp32.scan_consumer = scan_finished;
 	lws_esp32.scan_consumer_arg = vhd;
@@ -167,9 +176,16 @@ scan_start(struct per_vhost_data__esplws_scan *vhd)
 		lwsl_err("scan start failed %d\n", n);
 }
 
+static char scan_defer;
+
 static void timer_cb(TimerHandle_t t)
 {
 	struct per_vhost_data__esplws_scan *vhd = pvTimerGetTimerID(t);
+
+	if (!lws_esp32.inet && (scan_defer & 1)) {
+		/* if connected in AP mode, wait twice as long between scans */
+		return;
+	}
 
 	scan_start(vhd);
 }
@@ -214,11 +230,101 @@ client_connection(struct per_vhost_data__esplws_scan *vhd, const char *file)
 	return 0; /* ongoing */
 }
 
+static int
+lws_wifi_scan_rssi(struct lws_wifi_scan *p)
+{
+	if (!p->count)
+		return -127;
+
+	return p->rssi / p->count;
+}
+
+/*
+ * Insert new lws_wifi_scan into linkedlist in rssi-sorted order, trimming the
+ * list if needed to keep it at or below max_aps entries.
+ */
+
+static int
+lws_wifi_scan_insert_trim(struct lws_wifi_scan **list, struct lws_wifi_scan *ns)
+{
+	int count = 0, ins = 1, worst;
+	struct lws_wifi_scan *newlist, **pworst, *pp1;
+
+	lws_start_foreach_llp(struct lws_wifi_scan **, pp, *list) {
+		/* try to find existing match */
+		if (!strcmp((*pp)->ssid, ns->ssid) &&
+		    !memcmp((*pp)->bssid, ns->bssid, 6)) {
+			if ((*pp)->count > 127) {
+				(*pp)->count /= 2;
+				(*pp)->rssi /= 2;
+			}
+			(*pp)->rssi += ns->rssi;
+			(*pp)->count++;
+			ins = 0;
+			break;
+		}
+	} lws_end_foreach_llp(pp, next);
+
+	if (ins) {
+		lws_start_foreach_llp(struct lws_wifi_scan **, pp, *list) {
+			/* trim any excess guys */
+			if (count++ >= max_aps - 1) {
+				pp1 = *pp;
+				*pp = (*pp)->next;
+				free(pp1);
+				continue; /* stay where we are */
+			}
+		} lws_end_foreach_llp(pp, next);
+
+		/* we are inserting... so alloc a copy of him */
+		pp1 = malloc(sizeof(*pp1));
+		if (!pp1)
+			return -1;
+
+		memcpy(pp1, ns, sizeof(*pp1));
+		pp1->next = *list;
+		*list = pp1;
+	}
+
+	/* sort the list ... worst first, but added at the newlist head */
+
+	newlist = NULL;
+
+	/* while anybody left on the old list */
+	while (*list) {
+		worst = 0;
+		pworst = NULL;
+
+		/* who is the worst guy still left on the old list? */
+		lws_start_foreach_llp(struct lws_wifi_scan **, pp, *list) {
+			if (lws_wifi_scan_rssi(*pp) <= worst) {
+				worst = lws_wifi_scan_rssi(*pp);
+				pworst = pp;
+			}
+		} lws_end_foreach_llp(pp, next);
+
+		if (pworst) {
+			/* move the worst to the head of the new list */
+			pp1 = *pworst;
+			*pworst = (*pworst)->next;
+			pp1->next = newlist;
+			newlist = pp1;
+		}
+	}
+
+	*list = newlist;
+
+	return 0;
+}
+
 static void
 scan_finished(uint16_t count, wifi_ap_record_t *recs, void *v)
 {
 	struct per_vhost_data__esplws_scan *vhd = v;
 	struct per_session_data__esplws_scan *p = vhd->live_pss_list;
+	struct lws_wifi_scan lws;
+	wifi_ap_record_t *r;
+	int m;
 
 	lwsl_notice("%s: count %d\n", __func__, count);
 
@@ -232,11 +338,29 @@ scan_finished(uint16_t count, wifi_ap_record_t *recs, void *v)
 	memcpy(vhd->ap_records, recs, vhd->count_ap_records * sizeof(*recs));
 	
 	while (p) {
-		if (p->scan_state != SCAN_STATE_INITIAL && p->scan_state != SCAN_STATE_NONE)
+		if (p->scan_state != SCAN_STATE_INITIAL &&
+		    p->scan_state != SCAN_STATE_NONE)
 			p->changed_partway = 1;
 		else
 			p->scan_state = SCAN_STATE_INITIAL;
 		p = p->next;
+	}
+
+	/* convert to generic, cumulative scan results */
+
+	for (m = 0; m < vhd->count_ap_records; m++) {
+
+		r = &vhd->ap_records[m];
+
+		lws.authmode = r->authmode;
+		lws.channel = r->primary;
+		lws.rssi = r->rssi;
+		lws.count = 1;
+		memcpy(&lws.bssid, r->bssid, 6);
+		strncpy(lws.ssid, (const char *)r->ssid, sizeof(lws.ssid) - 1);
+		lws.ssid[sizeof(lws.ssid) - 1] = '\0';
+
+		lws_wifi_scan_insert_trim(&vhd->known_aps_list, &lws);
 	}
 
 	lws_callback_on_writable_all_protocol(vhd->context, vhd->protocol);
@@ -320,9 +444,9 @@ callback_esplws_scan(struct lws *wsi, enum lws_callback_reasons reason,
 	unsigned char *start = pss->buffer + LWS_PRE - 1, *p = start,
 		      *end = pss->buffer + sizeof(pss->buffer) - 1;
 	union lws_tls_cert_info_results ir;
+	struct lws_wifi_scan *lwscan;
 	char subject[64];
 	const char *pp;
-	wifi_ap_record_t *r;
 	int n, m;
 	nvs_handle nvh;
 	size_t s;
@@ -341,7 +465,7 @@ callback_esplws_scan(struct lws *wsi, enum lws_callback_reasons reason,
 			  (TimerCallbackFunction_t)timer_cb);
 		vhd->scan_ongoing = 0;
 		strcpy(vhd->json, " { }");
-		scan_start(vhd);
+	//	scan_start(vhd);
 		break;
 
 	case LWS_CALLBACK_PROTOCOL_DESTROY:
@@ -354,17 +478,17 @@ callback_esplws_scan(struct lws *wsi, enum lws_callback_reasons reason,
 	case LWS_CALLBACK_ESTABLISHED:
 		lwsl_notice("%s: ESTABLISHED\n", __func__);
 		if (!vhd->live_pss_list) {
-			scan_start(vhd);
+		//	scan_start(vhd);
 			xTimerStart(vhd->timer, 0);
 		}
 		vhd->count_live_pss++;
 		pss->next = vhd->live_pss_list;
 		vhd->live_pss_list = pss;
 		/* if we have scan results, update them.  Otherwise wait */
-		if (vhd->count_ap_records) {
+//		if (vhd->count_ap_records) {
 			pss->scan_state = SCAN_STATE_INITIAL;
 			lws_callback_on_writable(wsi);
-		}
+//		}
 		break;
 
 	case LWS_CALLBACK_SERVER_WRITEABLE:
@@ -481,6 +605,10 @@ callback_esplws_scan(struct lws *wsi, enum lws_callback_reasons reason,
 				      " \"unixtime\":\"%llu\",\n"
 				      " \"certissuer\":\"%s\",\n"
 				      " \"certsubject\":\"%s\",\n"
+				      " \"le_dns\":\"%s\",\n"
+				      " \"le_email\":\"%s\",\n"
+				      " \"acme_state\":\"%d\",\n"
+				      " \"acme_msg\":\"%s\",\n"
 				      " \"button\":\"%d\",\n"
 				      " \"group\":\"%s\",\n"
 				      " \"role\":\"%s\",\n",
@@ -499,6 +627,10 @@ callback_esplws_scan(struct lws *wsi, enum lws_callback_reasons reason,
 				      vhd->cert_remaining_days,
 				      (unsigned long long)t.tv_sec,
 				      ir.ns.name, subject,
+				      lws_esp32.le_dns,
+				      lws_esp32.le_email,
+				      vhd->acme_state,
+				      vhd->acme_msg,
 				      ((volatile struct lws_esp32 *)(&lws_esp32))->button_is_down,
 				      group, role);
 			p += snprintf((char *)p, end - p,
@@ -561,6 +693,7 @@ callback_esplws_scan(struct lws *wsi, enum lws_callback_reasons reason,
 					ssid, pp, use);
 			}
 			nvs_close(nvh);
+			pss->ap_record = 0;
 
 			p += snprintf((char *)p, end - p,
                                       "], \"aps\":[\n");
@@ -570,27 +703,36 @@ callback_esplws_scan(struct lws *wsi, enum lws_callback_reasons reason,
 			break;
 
 		case SCAN_STATE_LIST:
+			lwscan = vhd->known_aps_list;
+
+			n = pss->ap_record;
+			while (lwscan && n--)
+				lwscan = lwscan->next;
+
 			for (m = 0; m < 6; m++) {
 				n = LWS_WRITE_CONTINUATION | LWS_WRITE_NO_FIN;
-				if (pss->ap_record >= vhd->count_ap_records)
+				if (!lwscan)
 					goto scan_state_final;
 
 				if (pss->subsequent)
 					*p++ = ',';
 				pss->subsequent = 1;
+				pss->ap_record++;
 
-				r = &vhd->ap_records[(int)pss->ap_record++];
 				p += snprintf((char *)p, end - p,
 					      "{\"ssid\":\"%s\",\n"
 					       "\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\n"
 					       "\"rssi\":\"%d\",\n"
 					       "\"chan\":\"%d\",\n"
 					       "\"auth\":\"%d\"}\n",
-						r->ssid,
-						r->bssid[0], r->bssid[1], r->bssid[2],
-						r->bssid[3], r->bssid[4], r->bssid[5],
-						r->rssi, r->primary, r->authmode);
-				if (pss->ap_record >= vhd->count_ap_records)
+					       lwscan->ssid,
+					       lwscan->bssid[0], lwscan->bssid[1], lwscan->bssid[2],
+					       lwscan->bssid[3], lwscan->bssid[4], lwscan->bssid[5],
+					       lws_wifi_scan_rssi(lwscan),
+					       lwscan->channel, lwscan->authmode);
+
+				lwscan = lwscan->next;
+				if (!lwscan)
 					pss->scan_state = SCAN_STATE_FINAL;
 			}
 			break;
@@ -600,6 +742,7 @@ scan_state_final:
 			n = LWS_WRITE_CONTINUATION;
 			p += sprintf((char *)p, "]\n}\n");
 			if (pss->changed_partway) {
+				pss->changed_partway = 0;
 				pss->subsequent = 0;
 				pss->scan_state = SCAN_STATE_INITIAL;
 			} else {
@@ -620,6 +763,17 @@ issue:
 		if (pss->scan_state != SCAN_STATE_NONE)
 			lws_callback_on_writable(wsi);
 
+		break;
+
+	case LWS_CALLBACK_VHOST_CERT_UPDATE:
+		lwsl_notice("LWS_CALLBACK_VHOST_CERT_UPDATE: %d\n", (int)len);
+		vhd->acme_state = (int)len;
+		if (in) {
+			strncpy(vhd->acme_msg, in, sizeof(vhd->acme_msg) - 1);
+			vhd->acme_msg[sizeof(vhd->acme_msg) - 1] = '\0';
+			lwsl_notice("acme_msg: %s\n", (char *)in);
+		}
+		lws_callback_on_writable_all_protocol_vhost(vhd->vhost, vhd->protocol);
 		break;
 
 	case LWS_CALLBACK_RECEIVE:
@@ -643,6 +797,10 @@ issue:
 
 			if (strstr((const char *)in, "\"reset\""))
 				goto sched_reset;
+
+			if (!strncmp((const char *)in, "{\"job\":\"start-le\"", 17))
+				goto start_le;
+
 
 			if (nvs_open("lws-station", NVS_READWRITE, &nvh) != ESP_OK) {
 				lwsl_err("Unable to open nvs\n");
@@ -767,6 +925,61 @@ auton:
 				vhd->autonomous_update = 0;
 
 			break;
+
+start_le:
+			lws_esp32.acme = 1; /* hold off scanning */
+			puts(in);
+			/*
+			 * {"job":"start-le","cn":"home.warmcat.com",
+			 * "email":"andy@warmcat.com"}
+			 */
+
+			if (nvs_open("lws-station", NVS_READWRITE, &nvh) != ESP_OK) {
+				lwsl_err("Unable to open nvs\n");
+				break;
+			}
+
+			n = 0;
+			b = strstr(in, ",\"cn\":\"");
+			if (b) {
+				b += 7;
+				while (*b && *b != '\"' && n < sizeof(lws_esp32.le_dns) - 1)
+					lws_esp32.le_dns[n++] = *b++;
+			}
+			lws_esp32.le_dns[n] = '\0';
+
+			lws_nvs_set_str(nvh, "acme-cn", lws_esp32.le_dns);
+			n = 0;
+			b = strstr(in, ",\"email\":\"");
+			if (b) {
+				b += 10;
+				while (*b && *b != '\"' && n < sizeof(lws_esp32.le_email) - 1)
+					lws_esp32.le_email[n++] = *b++;
+			}
+			lws_esp32.le_email[n] = '\0';
+			lws_nvs_set_str(nvh, "acme-email", lws_esp32.le_email);
+			nvs_commit(nvh);
+
+			nvs_close(nvh);
+
+			lwsl_notice("cn: %s, email: %s\n", lws_esp32.le_dns, lws_esp32.le_email);
+
+			{
+				struct lws_acme_cert_aging_args caa;
+
+				memset(&caa, 0, sizeof(caa));
+				caa.vh = vhd->vhost;
+
+				caa.element_overrides[LWS_TLS_REQ_ELEMENT_COMMON_NAME] = lws_esp32.le_dns;
+				caa.element_overrides[LWS_TLS_REQ_ELEMENT_EMAIL] = lws_esp32.le_email;
+
+				lws_callback_vhost_protocols_vhost(vhd->vhost,
+						LWS_CALLBACK_VHOST_CERT_AGING,
+							(void *)&caa, 0);
+			}
+
+			break;
+
 		}
 
 	case LWS_CALLBACK_CLOSED:
